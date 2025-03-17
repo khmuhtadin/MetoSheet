@@ -1,0 +1,38 @@
+name: Daily Facebook Ads Sync
+
+on:
+  schedule:
+    - cron: '0 1 * * *' # Runs at 01:00 UTC daily (08:00 GMT+7)
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.7'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run sync script
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          AD_ACCOUNT1: ${{ secrets.AD_ACCOUNT1 }}
+          AD_ACCOUNT2: ${{ secrets.AD_ACCOUNT2 }}
+          AD_ACCOUNT3: ${{ secrets.AD_ACCOUNT3 }}
+          SPREADSHEET_NAME_PUB: ${{ secrets.SPREADSHEET_NAME_PUB }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+        run: |
+          echo "$GOOGLE_CREDENTIALS" > google_credentials.json
+          python main.py
+
+      - name: Clean up
+        run: rm -f google_credentials.json
