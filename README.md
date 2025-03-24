@@ -16,6 +16,10 @@
 - 🌐 Timezone support (GMT+7)
 - 📝 Comprehensive logging
 - ⚠️ Robust error handling
+- 💳 Automated billing transaction tracking
+- 🧾 Indonesian VAT (11%) calculation
+- 📃 Invoice URL generation
+- 💰 Multi-currency support
 
 ## 📋 Prerequisites
 
@@ -84,6 +88,15 @@ python main.py --date 2024-01-15
 
 # Fetch date range (use YYYY-MM-DD format)
 python main.py --start-date 2024-01-01 --end-date 2024-01-15
+
+# Fetch billing transactions
+python billing.py --start-date 2024-01-01 --end-date 2024-01-31
+
+# Fetch last 90 days of billing data
+python billing.py --last-days 90
+
+# Enable debug mode for detailed API responses
+python billing.py --debug
 ```
 
 ### 🤖 Automated Daily Sync
@@ -180,7 +193,7 @@ This project is licensed under the MIT License - see [LICENSE.md](LICENSE.md)
 
 ## 📬 Contact
 
-Muhammad Motului Khoirul
+Khairul Muhtadin
 
 - Twitter: [@khmuhtadin](https://twitter.com/khmuhtadin)
 - Email: hello@khmuhtadin.com
