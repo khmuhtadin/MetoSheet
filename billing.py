@@ -45,7 +45,7 @@ def load_environment_variables() -> Dict[str, Any]:
     
     # Get ad account IDs
     ad_account_ids = []
-    for acc in ['taff', 'otc', 'rho', 'biu', 'apx', 'jn', 'jm']:
+    for acc in ['ad_account1', 'ad_account2', 'ad_account3']:
         account_id = os.getenv(acc)
         if account_id:
             ad_account_ids.append(account_id)
