@@ -1,20 +1,208 @@
 import os
 import json
-from typing import List, Dict, Any
+import logging
+import time
+from typing import List, Dict, Any, Optional, Tuple
 from dotenv import load_dotenv
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 import argparse
 import traceback
 
+class Config:
+    """Centralized configuration management class."""
+    # Default values
+    DEFAULT_TAX_RATE = 0.11  # 11% VAT
+    DEFAULT_API_TIMEOUT = 15  # seconds
+    DEFAULT_API_RETRIES = 3
+    DEFAULT_TIMEZONE_OFFSET = 7  # GMT+7 (Jakarta)
+    DEFAULT_LOOKBACK_DAYS = 90
+    
+    # Meta API versions to try
+    API_VERSIONS = ["v21.0", "v22.0"]
+    
+    # Account types
+    ACCOUNT_TYPES = ["account1", "account2", "account3"]
+    
+    # Worksheet settings
+    WORKSHEET_NAME = 'Fetcher'
+    WORKSHEET_HEADERS = [
+        "Account",
+        "Transaction ID", 
+        "Faktur Pajak",
+        "Date (yyyy-mm-dd)",
+        "Amount",
+        "With Tax",
+        "Card",
+        "URL Invoice"
+    ]
+    
+    def __init__(self):
+        """Initialize configuration from environment variables."""
+        # Load environment variables
+        load_dotenv()
+        
+        # Load config values
+        self.tax_rate = float(os.getenv('TAX_RATE', self.DEFAULT_TAX_RATE))
+        self.api_timeout = int(os.getenv('API_TIMEOUT', self.DEFAULT_API_TIMEOUT))
+        self.api_retries = int(os.getenv('API_RETRIES', self.DEFAULT_API_RETRIES))
+        self.timezone_offset = int(os.getenv('TIMEZONE_OFFSET', self.DEFAULT_TIMEZONE_OFFSET))
+        
+        # Clean and load spreadsheet name
+        spreadsheet_name = os.getenv('spreadsheet_name_pub', '')
+        if '#' in spreadsheet_name:
+            spreadsheet_name = spreadsheet_name.split('#')[0]
+        self.spreadsheet_name = spreadsheet_name.replace("'", "").replace('"', "").strip()
+        
+        # Load Meta access token
+        self.access_token = os.getenv('META_ACCESS_TOKEN', '')
+        
+        # Load credentials file path
+        self.credentials_file = os.getenv('credentials_file')
+        
+        # Load ad account IDs
+        self.ad_account_ids = []
+        for acc in self.ACCOUNT_TYPES:
+            account_id = os.getenv(acc)
+            if account_id:
+                self.ad_account_ids.append(account_id)
+    
+    def is_valid(self) -> bool:
+        """Check if the configuration is valid."""
+        return (
+            self.access_token and 
+            len(self.ad_account_ids) > 0 and
+            self.credentials_file and
+            self.spreadsheet_name
+        )
+    
+    def get_validation_errors(self) -> List[str]:
+        """Get a list of validation error messages."""
+        errors = []
+        if not self.access_token:
+            errors.append("META_ACCESS_TOKEN not found in .env file!")
+        if not self.ad_account_ids:
+            errors.append("No ad account IDs found in .env file!")
+        if not self.credentials_file:
+            errors.append("credentials_file not found in .env file!")
+        if not self.spreadsheet_name:
+            errors.append("spreadsheet_name_pub not found in .env file!")
+        return errors
+    
+    def get_invoice_url(self, account_id: str, transaction_id: str) -> str:
+        """Get the invoice URL for a transaction."""
+        # Remove 'act_' prefix if present
+        account_id = account_id.replace('act_', '')
+        return f"https://business.facebook.com/ads/manage/billing_transaction/?act={account_id}&pdf=true&print=false&source=billing_summary&tx_type=3&txid={transaction_id}"
+
+# Create a global config instance
+config = Config()
+
+# Configure logging
+def setup_logging(debug: bool = False) -> None:
+    """Set up logging configuration."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    # Create logger
+    logger = logging.getLogger('meta_billing')
+    logger.setLevel(log_level)
+    # Prevent duplicate handlers if function is called multiple times
+    if logger.handlers:
+        return
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    # Add handler to logger
+    logger.addHandler(console_handler)
+
+# Get logger
+logger = logging.getLogger('meta_billing')
+
+# Configure requests with retry logic
+def create_requests_session(
+    retries: int = None,
+    backoff_factor: float = 0.3,
+    status_forcelist: tuple = (429, 500, 502, 503, 504),
+    timeout: int = None
+) -> requests.Session:
+    """Create a requests session with retry capability."""
+    session = requests.Session()
+    
+    # Use values from config if not specified
+    retries = retries if retries is not None else config.api_retries
+    timeout = timeout if timeout is not None else config.api_timeout
+    
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    session.timeout = timeout
+    return session
+
+# Create a session to be used throughout the script
+session = create_requests_session()
+
+def make_api_request(url: str, params: Dict[str, Any], method: str = 'GET') -> Optional[Dict[str, Any]]:
+    """Make API request with retry logic and proper error handling."""
+    try:
+        if method.upper() == 'GET':
+            response = session.get(url, params=params)
+        else:
+            response = session.post(url, json=params)
+        
+        # Handle rate limiting specifically
+        if response.status_code == 429:
+            retry_after = int(response.headers.get('Retry-After', 5))
+            logger.warning(f"Rate limited by API. Waiting {retry_after} seconds...")
+            time.sleep(retry_after)
+            # Retry the request
+            return make_api_request(url, params, method)
+        
+        # Check if the request was successful
+        response.raise_for_status()
+        
+        # Return JSON data if successful
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"API request failed with status code: {response.status_code}")
+            logger.error(f"Response: {response.text[:200]}...")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request failed: {str(e)}")
+        return None
+    except json.JSONDecodeError:
+        logger.error("Failed to decode API response as JSON")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error during API request: {str(e)}")
+        return None
+
 def parse_arguments() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Fetch Facebook Ads Transaction data')
     parser.add_argument('--start-date', type=str, help='Start date in YYYY-MM-DD format')
     parser.add_argument('--end-date', type=str, help='End date in YYYY-MM-DD format')
-    parser.add_argument('--last-days', type=int, default=90, help='Fetch data for the last N days')
+    parser.add_argument('--last-days', type=int, default=config.DEFAULT_LOOKBACK_DAYS, 
+                       help=f'Fetch data for the last N days (default: {config.DEFAULT_LOOKBACK_DAYS})')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debugging')
     return parser.parse_args()
 
@@ -36,23 +224,23 @@ def load_environment_variables() -> Dict[str, Any]:
     if '#' in spreadsheet_name:
         spreadsheet_name = spreadsheet_name.split('#')[0]
     spreadsheet_name = spreadsheet_name.replace("'", "").replace('"', "").strip()
-    print(f"Attempting to access spreadsheet: '{spreadsheet_name}'")
+    logger.info(f"Attempting to access spreadsheet: '{spreadsheet_name}'")
     
     # Debug: Print access token first few and last few characters
     access_token = os.getenv('META_ACCESS_TOKEN', '')
     token_preview = f"{access_token[:5]}...{access_token[-5:]}" if access_token else "NOT FOUND"
-    print(f"Access token loaded: {token_preview}")
+    logger.info(f"Access token loaded: {token_preview}")
     
     # Get ad account IDs
     ad_account_ids = []
-    for acc in ['ad_account1', 'ad_account2', 'ad_account3']:
+    for acc in ['otc', 'rho', 'biu', "taff", "apx", "jn", "jm", "taff_shopee", "taff_tokopedia", "otc_shopee", "otc_tokopedia", "rhodey_shopee", "rhodey_tokopedia", "taffomi_shopee", "biutte_shopee", "apexel_shopee"]:
         account_id = os.getenv(acc)
         if account_id:
             ad_account_ids.append(account_id)
-            print(f"Found account ID for {acc}: {account_id}")
+            logger.info(f"Found account ID for {acc}: {account_id}")
     
     if not ad_account_ids:
-        print("WARNING: No ad account IDs found in environment variables!")
+        logger.warning("WARNING: No ad account IDs found in environment variables!")
     
     return {
         'access_token': access_token,
@@ -63,7 +251,7 @@ def load_environment_variables() -> Dict[str, Any]:
 
 def test_api_connection(access_token: str, ad_account_id: str) -> Dict[str, Any]:
     """Test API connection and return account details."""
-    print(f"\n--- Testing API connection for account {ad_account_id} ---")
+    logger.info(f"Testing API connection for account {ad_account_id}")
     
     # Try current API versions
     api_versions = ["v21.0", "v22.0"]
@@ -72,22 +260,18 @@ def test_api_connection(access_token: str, ad_account_id: str) -> Dict[str, Any]
         url = f"https://graph.facebook.com/{version}/{ad_account_id}"
         params = {'access_token': access_token, 'fields': 'account_id,name,currency,account_status'}
         
-        print(f"Trying API version: {version}")
-        try:
-            response = requests.get(url, params=params)
-            print(f"Response status code: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                print(f"API connection successful for account {ad_account_id}:", json.dumps(result, indent=2))
-                print(f"Using API version: {version}")
-                return result
-            else:
-                print(f"Failed with {version}: {response.text}")
-        except Exception as e:
-            print(f"Error with {version}: {str(e)}")
+        logger.info(f"Trying API version: {version}")
+        
+        result = make_api_request(url, params)
+        if result:
+            logger.info(f"API connection successful for account {ad_account_id}")
+            logger.debug(f"Account details: {json.dumps(result, indent=2)}")
+            logger.info(f"Using API version: {version}")
+            return result
+        else:
+            logger.warning(f"Failed with API version {version}")
     
-    print(f"All API versions failed for account {ad_account_id}")
+    logger.error(f"All API versions failed for account {ad_account_id}")
     return {}
 
 def fetch_charge_activities(access_token: str, ad_account_id: str, start_date: str, end_date: str, debug: bool = False) -> List[Dict[str, Any]]:
@@ -100,31 +284,58 @@ def fetch_charge_activities(access_token: str, ad_account_id: str, start_date: s
     start_timestamp = int(start_dt.timestamp()) + (7 * 3600)
     end_timestamp = int(end_dt.timestamp()) + (7 * 3600)
     
-    print(f"\n--- Fetching activities for account {ad_account_id} ---")
+    logger.info(f"Fetching activities for account {ad_account_id} from {start_date} to {end_date}")
     
-    # Working versions
+    # Find working API version
+    working_version = find_working_api_version(access_token, ad_account_id)
+    if not working_version:
+        logger.error("Could not find working API version!")
+        return []
+    
+    # Use the working API version to fetch activities
+    all_activities = fetch_activities_with_multiple_approaches(
+        access_token, 
+        ad_account_id,
+        working_version,
+        start_date,
+        end_date,
+        start_timestamp,
+        end_timestamp,
+        debug
+    )
+    
+    # Filter for payment activities
+    payment_activities = filter_payment_activities(all_activities)
+    logger.info(f"Total payment activities found from target period: {len(payment_activities)}")
+    return payment_activities
+
+def find_working_api_version(access_token: str, ad_account_id: str) -> Optional[str]:
+    """Find a working API version for the given ad account."""
     api_versions = ["v21.0", "v22.0"]
-    working_version = None
     
     for version in api_versions:
         test_url = f"https://graph.facebook.com/{version}/{ad_account_id}"
         test_params = {'access_token': access_token, 'fields': 'name'}
         
-        try:
-            test_response = requests.get(test_url, params=test_params)
-            if test_response.status_code == 200:
-                working_version = version
-                print(f"Using API version: {working_version}")
-                break
-        except Exception:
-            continue
+        result = make_api_request(test_url, test_params)
+        if result:
+            logger.info(f"Using API version: {version}")
+            return version
     
-    if not working_version:
-        print("ERROR: Could not find working API version!")
-        return []
-    
-    # Use the working API version
-    url = f'https://graph.facebook.com/{working_version}/{ad_account_id}/activities'
+    return None
+
+def fetch_activities_with_multiple_approaches(
+    access_token: str, 
+    ad_account_id: str,
+    api_version: str,
+    start_date: str,
+    end_date: str,
+    start_timestamp: int,
+    end_timestamp: int,
+    debug: bool
+) -> List[Dict[str, Any]]:
+    """Try multiple approaches to fetch activities."""
+    url = f'https://graph.facebook.com/{api_version}/{ad_account_id}/activities'
     
     # Simple approaches focused on the specific date range
     approaches = [
@@ -158,65 +369,87 @@ def fetch_charge_activities(access_token: str, ad_account_id: str, start_date: s
     ]
     
     all_activities = []
-    success = False
+    target_year_month = start_date[:7]  # YYYY-MM
     
     for i, params in enumerate(approaches):
-        print(f"\nTrying approach {i+1} for date range {start_date} to {end_date}:")
-        print(f"Parameters: {json.dumps({k: v for k, v in params.items() if k != 'access_token'})}")
+        logger.info(f"Trying approach {i+1} for date range {start_date} to {end_date}")
+        logger.debug(f"Parameters: {json.dumps({k: v for k, v in params.items() if k != 'access_token'})}")
         
-        try:
-            response = requests.get(url, params=params)
+        result = make_api_request(url, params)
+        if not result:
+            logger.warning(f"Approach {i+1} failed")
+            continue
             
-            if debug:
-                print(f"Full API response for approach {i+1} (truncated):")
-                print(response.text[:300] + "..." if len(response.text) > 300 else response.text)
+        data_count = len(result.get('data', []))
+        logger.info(f"Success with approach {i+1}! Found {data_count} activities.")
+        
+        # Check if data could be from the right time period
+        if data_count > 0:
+            first_date = result['data'][0].get('event_time', '')
+            logger.info(f"First record date: {first_date}")
             
-            if response.status_code == 200:
-                result = response.json()
-                data_count = len(result.get('data', []))
-                print(f"Success with approach {i+1}! Found {data_count} activities.")
+            # Filter activities by target year-month
+            found_activities = []
+            for activity in result.get('data', []):
+                event_time = activity.get('event_time', '')
+                if target_year_month in event_time:
+                    found_activities.append(activity)
+            
+            if found_activities:
+                logger.info(f"Found {len(found_activities)} activities from {target_year_month}!")
                 
-                # Check if data could be from the right time period
-                if data_count > 0:
-                    # Check first record date
-                    first_date = result['data'][0].get('event_time', '')
-                    print(f"First record date: {first_date}")
-                    
-                    # Filter by actual date by checking for 2024 data
-                    target_year_month = start_date[:7]  # YYYY-MM
-                    found_activities = []
-                    
-                    for activity in result.get('data', []):
+                # Check for pagination and fetch more data if available
+                if 'paging' in result and 'next' in result['paging']:
+                    additional_activities = fetch_all_pages_from_next_url(result['paging']['next'], debug)
+                    # Filter additional activities
+                    for activity in additional_activities:
                         event_time = activity.get('event_time', '')
                         if target_year_month in event_time:
                             found_activities.append(activity)
-                    
-                    if found_activities:
-                        print(f"Found {len(found_activities)} activities from {target_year_month}!")
-                        all_activities = found_activities
-                        success = True
-                        break
-                    else:
-                        print(f"No data from {target_year_month} found, trying next approach...")
-                else:
-                    print("No data found with this approach, trying next one...")
+                    logger.info(f"Found additional {len(additional_activities)} activities from pagination")
+                
+                return found_activities
             else:
-                print(f"API error with approach {i+1}: {response.status_code}")
-                print(response.text[:200])
-        except Exception as e:
-            print(f"Exception with approach {i+1}: {str(e)}")
-            traceback.print_exc()
+                logger.info(f"No data from {target_year_month} found, trying next approach...")
+        else:
+            logger.info("No data found with this approach, trying next one...")
     
-    if not success:
-        print("\n⚠ Important Note:")
-        print(f"Meta might not provide access to data from {start_date} anymore.")
-        print("Meta typically restricts historical data access to recent months only.")
-        print("Try a more recent date range or contact Meta support for historical data access.")
+    # If we get here, no approach was successful
+    logger.warning("\n⚠ Important Note:")
+    logger.warning(f"Meta might not provide access to data from {start_date} anymore.")
+    logger.warning("Meta typically restricts historical data access to recent months only.")
+    logger.warning("Try a more recent date range or contact Meta support for historical data access.")
     
-    # Filter for payment activities
-    payment_activities = filter_payment_activities(all_activities)
-    print(f"Total payment activities found from target period: {len(payment_activities)}")
-    return payment_activities
+    return []
+
+def fetch_all_pages_from_next_url(next_url: str, debug: bool) -> List[Dict[str, Any]]:
+    """Fetch all pages of results using the next URL from pagination."""
+    all_data = []
+    page_count = 1
+    current_url = next_url
+    
+    while current_url:
+        logger.info(f"Fetching page {page_count + 1}...")
+        
+        # The URL already contains all parameters, so don't pass any params
+        result = make_api_request(current_url, {})
+        if not result:
+            break
+            
+        new_data = result.get('data', [])
+        all_data.extend(new_data)
+        logger.info(f"Got {len(new_data)} more activities")
+        page_count += 1
+        
+        if debug and new_data:
+            logger.debug(f"Sample from page {page_count}:")
+            logger.debug(json.dumps(new_data[0], indent=2)[:300] + "...")
+        
+        # Get next page URL if available
+        current_url = result.get('paging', {}).get('next')
+    
+    logger.info(f"Fetched {page_count} pages with total {len(all_data)} activities")
+    return all_data
 
 def filter_payment_activities(activities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Filter activities to find payment-related ones."""
@@ -227,12 +460,12 @@ def filter_payment_activities(activities: List[Dict[str, Any]]) -> List[Dict[str
             activity.get('event_type', '').lower().find('bill') >= 0)
     ]
     
-    print(f"Filtered {len(payment_activities)} payment activities from {len(activities)} total activities")
+    logger.info(f"Filtered {len(payment_activities)} payment activities from {len(activities)} total activities")
     
     # Print sample of the first payment activity if available
     if payment_activities:
-        print("Sample payment activity:")
-        print(json.dumps(payment_activities[0], indent=2)[:300] + "...")
+        logger.info("Sample payment activity:")
+        logger.info(json.dumps(payment_activities[0], indent=2)[:300] + "...")
     
     return payment_activities
 
@@ -245,7 +478,7 @@ def fetch_all_pages(url: str, params: Dict[str, Any], first_result: Dict[str, An
     # Handle pagination
     while 'paging' in result and 'next' in result['paging']:
         next_url = result['paging']['next']
-        print(f"Fetching page {page_count + 1}...")
+        logger.info(f"Fetching page {page_count + 1}...")
         
         try:
             response = requests.get(next_url)
@@ -254,26 +487,26 @@ def fetch_all_pages(url: str, params: Dict[str, Any], first_result: Dict[str, An
                 result = response.json()
                 new_data = result.get('data', [])
                 all_data.extend(new_data)
-                print(f"Got {len(new_data)} more activities")
+                logger.info(f"Got {len(new_data)} more activities")
                 page_count += 1
                 
                 if debug:
-                    print(f"Sample from page {page_count}:")
+                    logger.info(f"Sample from page {page_count}:")
                     if new_data:
-                        print(json.dumps(new_data[0], indent=2)[:300] + "...")
+                        logger.info(json.dumps(new_data[0], indent=2)[:300] + "...")
             else:
-                print(f"Error fetching next page: {response.text}")
+                logger.error(f"Error fetching next page: {response.text}")
                 break
         except Exception as e:
-            print(f"Exception while fetching page {page_count + 1}: {str(e)}")
+            logger.error(f"Exception while fetching page {page_count + 1}: {str(e)}")
             break
     
-    print(f"Fetched {page_count} pages with total {len(all_data)} activities")
+    logger.info(f"Fetched {page_count} pages with total {len(all_data)} activities")
     return all_data
 
 def get_date_range(days: int) -> tuple:
     """Get start and end dates based on number of days to look back."""
-    end_date = datetime.utcnow() + timedelta(hours=7)  # GMT+7
+    end_date = datetime.utcnow() + timedelta(hours=config.timezone_offset)  # Use config timezone offset
     start_date = end_date - timedelta(days=days)
     return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
 
@@ -291,42 +524,33 @@ def initialize_google_sheets(credentials_file: str, spreadsheet_name: str) -> gs
         # Try to get existing spreadsheet
         try:
             spreadsheet = client.open(spreadsheet_name)
-            print(f"Successfully opened spreadsheet: {spreadsheet_name}")
+            logger.info(f"Successfully opened spreadsheet: {spreadsheet_name}")
         except gspread.exceptions.SpreadsheetNotFound:
-            print(f"Spreadsheet '{spreadsheet_name}' not found. Please check:")
-            print("1. The spreadsheet name in your .env file matches exactly")
-            print("2. The service account email has been given access to the spreadsheet")
-            print("3. The spreadsheet exists in Google Drive")
+            logger.error(f"Spreadsheet '{spreadsheet_name}' not found. Please check:")
+            logger.error("1. The spreadsheet name in your .env file matches exactly")
+            logger.error("2. The service account email has been given access to the spreadsheet")
+            logger.error("3. The spreadsheet exists in Google Drive")
             raise
         
-        worksheet_name = 'Meta Transaction IDs'
+        # Use worksheet name from config
+        worksheet_name = config.WORKSHEET_NAME
         
         try:
             sheet = spreadsheet.worksheet(worksheet_name)
-            print(f"Found existing worksheet: {worksheet_name}")
+            logger.info(f"Found existing worksheet: {worksheet_name}")
         except gspread.exceptions.WorksheetNotFound:
-            print(f"Creating new worksheet: {worksheet_name}")
+            logger.info(f"Creating new worksheet: {worksheet_name}")
             sheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
         
         # Check and set headers if needed
         if not sheet.row_values(1):
-            headers = [
-                "Account",
-                "Transaction ID",
-                "Faktur Pajak",
-                "Date (yyyy-mm-dd)",
-                "Amount",
-                "With Tax",
-                "Card",
-                "URL Invoice"
-            ]
-            sheet.append_row(headers)
-            print("Added headers to worksheet")
+            sheet.append_row(config.WORKSHEET_HEADERS)
+            logger.info("Added headers to worksheet")
         
         return sheet
         
     except Exception as e:
-        print(f"Error initializing Google Sheets: {str(e)}")
+        logger.error(f"Error initializing Google Sheets: {str(e)}")
         traceback.print_exc()
         raise
 
@@ -335,7 +559,7 @@ def process_transaction_data(account_info: Dict[str, Any], activities: List[Dict
     transactions = []
     account_name = account_info.get('name', 'Unknown Account')
     
-    print(f"\n--- Processing {len(activities)} activities for {account_name} ---")
+    logger.info(f"Processing {len(activities)} activities for {account_name}")
     
     for activity in activities:
         # Handle extra_data which might be a string or a dict
@@ -346,20 +570,20 @@ def process_transaction_data(account_info: Dict[str, Any], activities: List[Dict
             try:
                 extra_data = json.loads(extra_data_raw)
             except json.JSONDecodeError:
-                print(f"Could not parse extra_data as JSON: {extra_data_raw}")
+                logger.error(f"Could not parse extra_data as JSON: {extra_data_raw}")
                 extra_data = {"raw_data": extra_data_raw}
         else:
             extra_data = extra_data_raw
             
         # Debug: print out activity type and extra_data structure
-        print(f"\nProcessing activity type: {activity.get('event_type')}")
-        print(f"Extra data type: {type(extra_data)}")
+        logger.debug(f"Processing activity type: {activity.get('event_type')}")
+        logger.debug(f"Extra data type: {type(extra_data)}")
         
         if isinstance(extra_data, dict):
             # Just print keys to avoid large output
-            print(f"Extra data keys: {list(extra_data.keys())}")
+            logger.debug(f"Extra data keys: {list(extra_data.keys())}")
         else:
-            print(f"Extra data content: {extra_data}")
+            logger.debug(f"Extra data content: {extra_data}")
         
         # Extract transaction ID directly from the data we have
         transaction_id = None
@@ -368,7 +592,7 @@ def process_transaction_data(account_info: Dict[str, Any], activities: List[Dict
             for key in ['transaction_id', 'id', 'charge_id', 'payment_id']:
                 if key in extra_data:
                     transaction_id = extra_data[key]
-                    print(f"Found transaction ID '{transaction_id}' in key '{key}'")
+                    logger.debug(f"Found transaction ID '{transaction_id}' in key '{key}'")
                     break
         
         # Extract amount - try different possible keys
@@ -377,15 +601,13 @@ def process_transaction_data(account_info: Dict[str, Any], activities: List[Dict
             for key in ['new_value', 'amount', 'charge_amount', 'value']:
                 if key in extra_data:
                     amount = extra_data[key]
-                    print(f"Found amount '{amount}' in key '{key}'")
+                    logger.debug(f"Found amount '{amount}' in key '{key}'")
                     break
         
-        # Calculate tax - for Indonesia, standard VAT is 11%
+        # Calculate tax - use tax rate from config
         tax_amount = None
         if amount and isinstance(amount, (int, float)):
-            # Calculate tax amount (11% of base amount)
-            tax_rate = 0.11
-            tax_amount = round(amount * tax_rate)  # 11% of pre-tax amount
+            tax_amount = round(amount * config.tax_rate)  # Use tax rate from config
         
         # Extract currency
         currency = None
@@ -427,12 +649,12 @@ def process_transaction_data(account_info: Dict[str, Any], activities: List[Dict
                     if isinstance(timestamp, str) and 'T' in timestamp:
                         # Parse ISO format date and adjust to GMT+7
                         dt = datetime.strptime(timestamp.split('+')[0], '%Y-%m-%dT%H:%M:%S')
-                        dt = dt + timedelta(hours=7)  # Adjust to GMT+7
+                        dt = dt + timedelta(hours=config.timezone_offset)  # Use timezone offset from config
                         event_date = dt.strftime('%Y-%m-%d')
                     elif isinstance(timestamp, (int, float)):
                         # Handle numeric timestamp (already in UTC)
                         dt = datetime.fromtimestamp(timestamp)
-                        dt = dt + timedelta(hours=7)  # Adjust to GMT+7
+                        dt = dt + timedelta(hours=config.timezone_offset)  # Use timezone offset from config
                         event_date = dt.strftime('%Y-%m-%d')
                     else:
                         # Try general approach
@@ -452,32 +674,49 @@ def process_transaction_data(account_info: Dict[str, Any], activities: List[Dict
                         'event_type': activity.get('event_type'),
                         'account_id': account_id
                     })
-                    print(f"Successfully extracted transaction: {transaction_id} - {event_date} - {amount} {currency} (Tax: {tax_amount}, Card: {card_number})")
+                    logger.info(f"Extracted transaction: {transaction_id} - {event_date} - {amount} {currency} (Tax: {tax_amount}, Card: {card_number})")
                 except Exception as e:
-                    print(f"Error processing date for activity: {str(e)}")
+                    logger.error(f"Error processing date for activity: {str(e)}")
                     traceback.print_exc()
     
-    print(f"Total {len(transactions)} transactions extracted")
+    logger.info(f"Total {len(transactions)} transactions extracted")
     return transactions
 
-def save_to_sheets(sheet: gspread.Worksheet, transactions: List[Dict[str, Any]]):
-    """Save transaction data to Google Sheets."""
-    existing_transaction_ids = sheet.col_values(2)[1:] if sheet.row_count > 1 else []
+def save_to_sheets(sheet: gspread.Worksheet, transactions: List[Dict[str, Any]]) -> int:
+    """Save transaction data to Google Sheets using batch operations for better performance.
     
-    count = 0
-    for transaction in transactions:
+    Returns:
+        int: Number of new transactions added
+    """
+    # First, get all existing transaction IDs to avoid duplicates
+    try:
+        existing_transaction_ids = set(sheet.col_values(2)[1:] if sheet.row_count > 1 else [])
+        logger.info(f"Found {len(existing_transaction_ids)} existing transactions in sheet")
+    except Exception as e:
+        logger.error(f"Error fetching existing transaction IDs: {str(e)}")
+        return 0
+    
+    # Filter out transactions that already exist
+    new_transactions = [t for t in transactions if t.get('transaction_id', '') not in existing_transaction_ids]
+    
+    if not new_transactions:
+        logger.info("No new transactions to add")
+        return 0
+    
+    logger.info(f"Preparing to add {len(new_transactions)} new transactions")
+    
+    # Prepare batch data
+    batch_rows = []
+    
+    for transaction in new_transactions:
         transaction_id = transaction.get('transaction_id', '')
-        
-        if transaction_id in existing_transaction_ids:
-            print(f"Skipping duplicate transaction ID: {transaction_id}")
-            continue
-        
         # Get base amount and calculate total with tax
         base_amount = transaction.get('amount', 0)
-        total_with_tax = base_amount + round(base_amount * 0.11)  # Base + 11% tax
+        total_with_tax = base_amount + round(base_amount * config.tax_rate)  # Use tax rate from config
         
         account_id = transaction.get('account_id', '')
-        invoice_url = f"https://business.facebook.com/ads/manage/billing_transaction/?act={account_id}&pdf=true&print=false&source=billing_summary&tx_type=3&txid={transaction_id}"
+        # Use the get_invoice_url method from config
+        invoice_url = config.get_invoice_url(account_id, transaction_id)
             
         row = [
             transaction.get('account', ''),
@@ -490,47 +729,127 @@ def save_to_sheets(sheet: gspread.Worksheet, transactions: List[Dict[str, Any]])
             invoice_url
         ]
         
-        sheet.append_row(row, value_input_option='USER_ENTERED')
-        count += 1
-        print(f"Added transaction {transaction_id} for {transaction.get('account')} on {transaction.get('date')} - Amount: {base_amount}, With Tax: {total_with_tax}")
+        batch_rows.append(row)
     
-    print(f"Total {count} new transactions added to Google Sheets")
+    # Use batch update for better performance
+    try:
+        if batch_rows:
+            # Get the starting row for insertion
+            start_row = sheet.row_count + 1
+            
+            # Define the range for batch update
+            range_name = f"A{start_row}:{chr(65 + len(batch_rows[0]) - 1)}{start_row + len(batch_rows) - 1}"
+            
+            # Perform batch update
+            sheet.update(range_name, batch_rows)
+            
+            logger.info(f"Successfully added {len(batch_rows)} transactions in batch")
+            
+            # Log some details of the first few transactions
+            for i, row in enumerate(batch_rows[:3]):
+                logger.info(f"Added: {row[1]} for {row[0]} on {row[3]} - Amount: {row[4]}, With Tax: {row[5]}")
+                
+            if len(batch_rows) > 3:
+                logger.info(f"... and {len(batch_rows) - 3} more transactions")
+                
+            return len(batch_rows)
+        else:
+            return 0
+            
+    except gspread.exceptions.APIError as e:
+        logger.error(f"Google Sheets API error: {str(e)}")
+        
+        # Fallback to single row insertion if batch fails
+        logger.info("Falling back to one-by-one row insertion")
+        count = 0
+        
+        for row in batch_rows:
+            try:
+                sheet.append_row(row, value_input_option='USER_ENTERED')
+                count += 1
+            except Exception as inner_e:
+                logger.error(f"Error adding row {count + 1}: {str(inner_e)}")
+                
+        logger.info(f"Added {count} rows with fallback method")
+        return count
+        
+    except Exception as e:
+        logger.error(f"Unexpected error in batch update: {str(e)}")
+        traceback.print_exc()
+        return 0
 
 def main():
+    # Parse arguments first
     args = parse_arguments()
-    env_vars = load_environment_variables()
     
-    print("\n=== META ADS TRANSACTION FETCHER ===")
-    print(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Debug mode: {'ON' if args.debug else 'OFF'}")
+    # Set up logging with debug flag before any logging calls
+    setup_logging(args.debug)
     
-    # Check for required environment variables
-    if not env_vars['access_token']:
-        print("ERROR: META_ACCESS_TOKEN not found in .env file!")
-        return
-        
-    if not env_vars['ad_account_ids']:
-        print("ERROR: No ad account IDs found in .env file!")
-        return
-        
-    if not env_vars['credentials_file']:
-        print("ERROR: credentials_file not found in .env file!")
-        return
-        
-    if not env_vars['spreadsheet_name']:
-        print("ERROR: spreadsheet_name_pub not found in .env file!")
+    logger.info("\n=== META ADS TRANSACTION FETCHER ===")
+    logger.info(f"Run time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Debug mode: {'ON' if args.debug else 'OFF'}")
+    
+    # Validate configuration
+    if not config.is_valid():
+        errors = config.get_validation_errors()
+        for error in errors:
+            logger.error(f"Configuration error: {error}")
         return
     
-    # Determine date range
+    # Log configuration info
+    logger.info(f"Spreadsheet: '{config.spreadsheet_name}'")
+    token_preview = f"{config.access_token[:5]}...{config.access_token[-5:]}" if config.access_token else "NOT FOUND"
+    logger.info(f"Access token: {token_preview}")
+    logger.info(f"Found {len(config.ad_account_ids)} ad account IDs")
+    
+    # Determine and validate date range
+    date_range = determine_date_range(args)
+    if not date_range:
+        return
+    
+    start_date, end_date = date_range
+    
+    try:
+        # Initialize Google Sheets
+        sheet = initialize_google_sheets(config.credentials_file, config.spreadsheet_name)
+        
+        # Process each ad account
+        found_transactions = process_ad_accounts(
+            config.access_token,
+            config.ad_account_ids,
+            start_date,
+            end_date,
+            sheet,
+            args.debug
+        )
+        
+        if not found_transactions:
+            logger.warning("\n=== NO TRANSACTIONS FOUND ===")
+            logger.warning("Check the following:")
+            logger.warning("1. Historical Data Limits: Meta API typically only provides recent data (90-180 days)")
+            logger.warning("2. Try running with a more recent date range (last 30-60 days)")
+            logger.warning("3. For older data, download reports directly from Meta Business Manager")
+        else:
+            logger.info(f"Successfully found and processed transactions for the period {start_date} to {end_date}")
+            
+    except Exception as e:
+        logger.error(f"ERROR: {str(e)}")
+        traceback.print_exc()
+
+def determine_date_range(args: argparse.Namespace) -> Optional[Tuple[str, str]]:
+    """Determine and validate the date range."""
+    # If start and end dates are provided in arguments
     if args.start_date and args.end_date:
         if not (validate_date(args.start_date) and validate_date(args.end_date)):
-            print("ERROR: Invalid date format. Please use YYYY-MM-DD format.")
-            return
+            logger.error("ERROR: Invalid date format. Please use YYYY-MM-DD format.")
+            return None
         start_date, end_date = args.start_date, args.end_date
-        print(f"Using command-line date range: {start_date} to {end_date}")
+        logger.info(f"Using command-line date range: {start_date} to {end_date}")
     else:
-        start_date, end_date = get_date_range(args.last_days)
-        print(f"Using default date range (last {args.last_days} days): {start_date} to {end_date}")
+        # Use default date range based on --last-days argument (or config default)
+        days = args.last_days if args.last_days else config.DEFAULT_LOOKBACK_DAYS
+        start_date, end_date = get_date_range(days)
+        logger.info(f"Using default date range (last {days} days): {start_date} to {end_date}")
     
     # Verify date range makes sense
     try:
@@ -538,54 +857,51 @@ def main():
         end_dt = datetime.strptime(end_date, '%Y-%m-%d')
         
         if start_dt > end_dt:
-            print(f"ERROR: Start date {start_date} is after end date {end_date}!")
-            return
+            logger.error(f"ERROR: Start date {start_date} is after end date {end_date}!")
+            return None
     except ValueError:
-        print("ERROR: Could not parse dates. Please use YYYY-MM-DD format.")
-        return
+        logger.error("ERROR: Could not parse dates. Please use YYYY-MM-DD format.")
+        return None
+        
+    return start_date, end_date
+
+def process_ad_accounts(
+    access_token: str,
+    ad_account_ids: List[str],
+    start_date: str,
+    end_date: str,
+    sheet: gspread.Worksheet,
+    debug: bool
+) -> bool:
+    """Process all ad accounts and save transactions to sheet."""
+    found_transactions = False
     
-    try:
-        # Initialize Google Sheets
-        sheet = initialize_google_sheets(env_vars['credentials_file'], env_vars['spreadsheet_name'])
-        
-        # Process each ad account
-        found_transactions = False
-        
-        for ad_account_id in env_vars['ad_account_ids']:
-            account_info = test_api_connection(env_vars['access_token'], ad_account_id)
-            if account_info:
-                # Get activities containing transaction information
-                activities = fetch_charge_activities(
-                    env_vars['access_token'], 
-                    ad_account_id, 
-                    start_date, 
-                    end_date,
-                    debug=args.debug
-                )
-                
-                if activities:
-                    # Process transaction data
-                    transactions = process_transaction_data(account_info, activities)
-                    
-                    if transactions:
-                        found_transactions = True
-                        # Save to Google Sheets
-                        save_to_sheets(sheet, transactions)
-                    else:
-                        print(f"No valid transactions found for account {ad_account_id}")
-                else:
-                    print(f"No activities found for account {ad_account_id} in the specified date range")
-        
-        if not found_transactions:
-            print("\n=== NO TRANSACTIONS FOUND ===")
-            print("Check the following:")
-            print("1. Historical Data Limits: Meta API typically only provides recent data (90-180 days)")
-            print("2. Try running with a more recent date range (last 30-60 days)")
-            print("3. For older data, download reports directly from Meta Business Manager")
+    for ad_account_id in ad_account_ids:
+        account_info = test_api_connection(access_token, ad_account_id)
+        if account_info:
+            # Get activities containing transaction information
+            activities = fetch_charge_activities(
+                access_token, 
+                ad_account_id, 
+                start_date, 
+                end_date,
+                debug=debug
+            )
             
-    except Exception as e:
-        print(f"ERROR: {str(e)}")
-        traceback.print_exc()
+            if activities:
+                # Process transaction data
+                transactions = process_transaction_data(account_info, activities)
+                
+                if transactions:
+                    found_transactions = True
+                    # Save to Google Sheets
+                    save_to_sheets(sheet, transactions)
+                else:
+                    logger.info(f"No valid transactions found for account {ad_account_id}")
+            else:
+                logger.info(f"No activities found for account {ad_account_id} in the specified date range")
+                
+    return found_transactions
 
 if __name__ == "__main__":
     main()

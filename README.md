@@ -200,3 +200,137 @@ Khairul Muhtadin
 - Discord: khmuhtadin
 
 ⭐️ Star me on GitHub — it motivates a lot!
+
+# Meta Ads Transaction Fetcher
+
+This script fetches Meta (Facebook) Ads transaction data and stores it in a Google Sheet for easy tracking and reporting.
+
+## Features
+
+- Fetches transaction data from multiple Meta Ad accounts
+- Extracts transaction details including transaction ID, date, amount, and card information
+- Calculates tax amounts based on configurable tax rate
+- Stores data in Google Sheets with duplicate prevention
+- Handles API pagination and rate limiting
+- Supports date range filtering via command-line arguments
+
+## Requirements
+
+- Python 3.7+
+- Google API credentials for Google Sheets access
+- Meta (Facebook) API access token with permissions to access Ad account data
+- Environment variables configured in a `.env` file
+
+## Installation
+
+1. Clone this repository:
+
+   ```
+   git clone https://github.com/yourusername/meta-billing-fetcher.git
+   cd meta-billing-fetcher
+   ```
+
+2. Install the required packages:
+
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. Create a `.env` file with the following variables:
+
+   ```
+   # Meta API credentials
+   META_ACCESS_TOKEN=your_meta_api_token_here
+
+   # Google Sheets credentials
+   credentials_file=path_to_google_sheets_credentials.json
+   spreadsheet_name_pub="Your Google Spreadsheet Name"
+
+   # Account IDs (add all accounts you want to track)
+   otc=act_123456789
+   rho=act_987654321
+   # ... additional accounts as needed
+
+   # Optional configuration
+   TAX_RATE=0.11
+   TIMEZONE_OFFSET=7
+   API_TIMEOUT=15
+   API_RETRIES=3
+   ```
+
+4. Set up Google Sheets API access:
+   - Go to [Google Cloud Console](https://console.cloud.google.com/)
+   - Create a new project or select an existing one
+   - Enable the Google Sheets API
+   - Create a service account and download the JSON credentials file
+   - Share your Google Sheet with the service account email address
+
+## Usage
+
+Basic usage:
+
+```
+python billing.py
+```
+
+This will fetch transaction data for the last 90 days for all configured accounts.
+
+### Command-line options:
+
+```
+python billing.py --help
+```
+
+Output:
+
+```
+usage: billing.py [-h] [--start-date START_DATE] [--end-date END_DATE] [--last-days LAST_DAYS] [--debug]
+
+Fetch Facebook Ads Transaction data
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --start-date START_DATE
+                        Start date in YYYY-MM-DD format
+  --end-date END_DATE   End date in YYYY-MM-DD format
+  --last-days LAST_DAYS
+                        Fetch data for the last N days (default: 90)
+  --debug               Enable verbose debugging
+```
+
+Examples:
+
+1. Fetch data for a specific date range:
+
+   ```
+   python billing.py --start-date 2024-01-01 --end-date 2024-01-31
+   ```
+
+2. Fetch data for the last 30 days with debug information:
+   ```
+   python billing.py --last-days 30 --debug
+   ```
+
+## Output
+
+The script writes transaction data to a worksheet named "Meta Transaction IDs" in your specified Google Spreadsheet with the following columns:
+
+- Account: Ad account name
+- Transaction ID: Unique transaction identifier
+- Faktur Pajak: (Empty column for manual tax invoice number entry)
+- Date: Transaction date in YYYY-MM-DD format
+- Amount: Original transaction amount
+- With Tax: Amount including tax (calculated based on TAX_RATE)
+- Card: Card number (last 4 digits)
+- URL Invoice: Direct link to the invoice in Meta Business Manager
+
+## Troubleshooting
+
+- **Missing Data**: Meta API typically only provides recent data (90-180 days). For older data, download reports directly from Meta Business Manager.
+- **API Errors**: Check your access token permissions and validity.
+- **Rate Limiting**: The script includes automatic retry logic for rate limiting. If you consistently hit limits, try reducing the date range.
+- **Google Sheets Errors**: Ensure the service account has edit access to the spreadsheet.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
