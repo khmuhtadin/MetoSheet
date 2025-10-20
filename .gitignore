@@ -1,6 +1,15 @@
 # Environment variables
 .env
 
+# Credentials & Secrets
+crex.json
+credentials.json
+*credentials*.json
+*.key
+*.pem
+*.p12
+service-account*.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,14 +28,18 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
 # Virtual Environment
 venv/
 ENV/
 env/
+.venv/
 .env/
 
 # IDE specific files
@@ -34,16 +47,24 @@ env/
 .vscode/
 *.swp
 *.swo
+*.swn
 .DS_Store
+*.sublime-project
+*.sublime-workspace
 
-# Google API credentials
-crex.json
-*.json
-
-# Logs
+# Logs & Debug
 *.log
+*.log.*
+debug_*.py
+test_*.py
 
 # Local development
 .python-version
-crex.json
-*.jsoncrex.json
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS specific
+Thumbs.db
+.Spotlight-V100
+.Trashes
